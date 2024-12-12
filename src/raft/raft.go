@@ -37,7 +37,7 @@ const (
 	Follower  State = "Follower"
 )
 
-const HeartbeatInterval = 100 * time.Millisecond
+const HeartbeatInterval = 60 * time.Millisecond
 
 // ApplyMsg as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -78,8 +78,6 @@ type Raft struct {
 
 	electionTimer *time.Timer
 	online        bool
-	// heartbeatChan is the channel to recieve heartbeat
-	heartbeatChan chan bool
 	// resetChan is the channel to reset electionTimer
 	resetChan chan bool
 
@@ -209,10 +207,11 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	rf.resetChan <- true
+
 	if rf.currentTerm < args.Term {
 		rf.convertToFollower(args.Term)
 	}
-	rf.resetChan <- true
 
 	reply.Term = rf.currentTerm
 
@@ -232,17 +231,15 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	// Your code here.
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.Success = false
 
 	// if the server's current term is less than term of the request, reject.
 	if rf.currentTerm > args.Term {
+		reply.Term = rf.currentTerm
 		return
 	}
 
-	rf.heartbeatChan <- true
-
-	if rf.currentTerm < args.Term {
-		rf.convertToFollower(args.Term)
-	}
+	rf.convertToFollower(args.Term)
 
 	rf.resetChan <- true
 }
@@ -301,24 +298,6 @@ func (rf *Raft) Kill() {
 	rf.persist()
 }
 
-// Election loop
-func (rf *Raft) runElectionTimer() {
-	for rf.online {
-		select {
-		case <-rf.heartbeatChan:
-			rf.electionTimer.Reset(randomElectionTimeout())
-
-		case <-rf.resetChan:
-			rf.electionTimer.Reset(randomElectionTimeout())
-
-		case <-rf.electionTimer.C:
-			if rf.state == Follower {
-				rf.startElection()
-			}
-		}
-	}
-}
-
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.convertToCandidate()
@@ -327,17 +306,16 @@ func (rf *Raft) startElection() {
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
 	}
-	ch := make(chan int, 5)
+	ch := make(chan int, len(rf.peers))
 	rf.mu.Unlock()
 
-	voteCnt := 1
 	for serverId := range rf.peers {
 		if serverId == rf.me {
 			continue
 		}
-		go func(peer int) {
+		go func() {
 			reply := &RequestVoteReply{}
-			if rf.sendRequestVote(peer, args, reply) {
+			if rf.sendRequestVote(serverId, args, reply) {
 				if rf.state != Candidate || rf.currentTerm != args.Term {
 					ch <- 0
 				} else if reply.Term > rf.currentTerm {
@@ -353,58 +331,23 @@ func (rf *Raft) startElection() {
 			} else {
 				ch <- 0
 			}
-		}(serverId)
+		}()
 	}
 
-	voteCnt = 1
-	totalVote := 1
+	voteCnt := 1
+	totalVoteCnt := 1
 	for ok := range ch {
 		if ok == 1 {
 			voteCnt++
 		}
-		totalVote++
+		totalVoteCnt++
 		if voteCnt > len(rf.peers)/2 {
 			rf.mu.Lock()
 			rf.convertToLeader()
 			rf.mu.Unlock()
 		}
-		if totalVote == len(rf.peers) {
+		if totalVoteCnt == len(rf.peers) {
 			break
-		}
-	}
-
-	time.Sleep(HeartbeatInterval)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.state == Follower || rf.state == Leader {
-		return
-	}
-	rf.convertToFollower(rf.currentTerm + 1)
-}
-
-func (rf *Raft) startLeader() {
-	go func() {
-		ticker := time.NewTicker(HeartbeatInterval) // 心跳间隔
-		defer ticker.Stop()
-
-		for rf.state == Leader {
-			rf.broadcastHeartbeat()
-			<-ticker.C
-		}
-	}()
-}
-
-func (rf *Raft) broadcastHeartbeat() {
-	rf.mu.Lock()
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-	rf.mu.Unlock()
-	for serverId := range rf.peers {
-		if serverId != rf.me && rf.state == Leader {
-			go rf.sendAppendEntries(serverId, args, &AppendEntriesReply{})
 		}
 	}
 }
@@ -431,7 +374,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		state:         Follower,
 		electionTimer: time.NewTimer(randomElectionTimeout()),
 		online:        true,
-		heartbeatChan: make(chan bool),
 		resetChan:     make(chan bool),
 	}
 
@@ -442,4 +384,45 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+// Election loop
+func (rf *Raft) runElectionTimer() {
+	for rf.online {
+		select {
+		case <-rf.resetChan:
+			rf.electionTimer.Reset(randomElectionTimeout())
+
+		case <-rf.electionTimer.C:
+			if rf.state != Leader {
+				rf.startElection()
+			}
+		}
+	}
+}
+
+func (rf *Raft) startLeader() {
+	go func() {
+		ticker := time.NewTicker(HeartbeatInterval)
+		defer ticker.Stop()
+
+		for rf.state == Leader {
+			rf.broadcastHeartbeat()
+			<-ticker.C
+		}
+	}()
+}
+
+func (rf *Raft) broadcastHeartbeat() {
+	rf.mu.Lock()
+	args := AppendEntriesArgs{
+		Term:     rf.currentTerm,
+		LeaderId: rf.me,
+	}
+	rf.mu.Unlock()
+	for serverId := range rf.peers {
+		if serverId != rf.me && rf.state == Leader {
+			go rf.sendAppendEntries(serverId, args, &AppendEntriesReply{})
+		}
+	}
 }
